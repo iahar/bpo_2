@@ -28,7 +28,6 @@
     <Compile Include="file_operations\file_manager.py" />
     <Compile Include="file_operations\json_xml_handler.py" />
     <Compile Include="file_operations\zip_handler.py" />
-    <Compile Include="security\auth.py" />
     <Compile Include="security\path_validator.py" />
   </ItemGroup>
   <ItemGroup>

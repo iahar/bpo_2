@@ -5,66 +5,157 @@ import zipfile
 import shutil
 import getpass
 import platform
-from datetime import datetime
 import hashlib
+import time
+import sqlite3
+from datetime import datetime
+from database.models import DatabaseManager
+from database.operations import SecureDBOperations
 
 class UserManager:
     def __init__(self):
-        self.users_file = "users.json"
+        self.db = DatabaseManager()
         self.current_user = None
-        self.load_users()
+        self.max_attempts = 6
+        self.lockout_time = 300
+        self.delay_time = 2
+    
+        # Проверяем и создаем таблицу login_attempts если её нет
+        self.ensure_login_attempts_table()
 
-    def load_users(self):
-        """Загрузка пользователей из файла"""
-        if os.path.exists(self.users_file):
-            with open(self.users_file, 'r', encoding='utf-8') as f:
-                self.users = json.load(f)
-        else:
-            # Создаем начальных пользователей
-            self.users = {
-                'root': {  
-                'password': self.hash_password('root'),
-                'group': 'root',
-                'home_dir': '/root',
-                'full_name': 'Root'
-                },
-                'admin': {
-                    'password': self.hash_password('admin123'),
-                    'group': 'admin',
-                    'home_dir': '/home/admin',
-                    'full_name': 'System Administrator'
-                },
-                'user': {
-                    'password': self.hash_password('password1'),
-                    'group': 'users',
-                    'home_dir': '/home/user1',
-                    'full_name': 'User One'
-                }
-            }
-            self.save_users()
+    def ensure_login_attempts_table(self):
+        """Убедиться, что таблица login_attempts существует"""
+        try:
+            # Просто пытаемся выполнить запрос к таблице
+            test_query = "SELECT COUNT(*) FROM login_attempts"
+            self.db.execute_query(test_query)
+            print("✓ Таблица login_attempts существует")
+        except sqlite3.OperationalError:
+            print("✗ Таблица login_attempts не найдена, создаем...")
+            self.create_login_attempts_table()
+        except Exception as e:
+            print(f"Ошибка проверки таблицы login_attempts: {e}")
 
-    def save_users(self):
-        """Сохранение пользователей в файл"""
-        with open(self.users_file, 'w', encoding='utf-8') as f:
-            json.dump(self.users, f, ensure_ascii=False, indent=2)
+           
+    def get_user_home_dir(self, username):
+        """Получить домашнюю директорию пользователя"""
+        if not username:
+            return '/'
+        return f"/home/{username}"
+    
+    def create_home_directory(self, username, user_group='users'):
+        """Создать домашнюю директорию для нового пользователя"""
+        if not username:
+            return False
+        
+        home_path = f"/home/{username}"
+        return True
+
+    def create_login_attempts_table(self):
+        """Создать таблицу login_attempts"""
+        try:
+            # Вместо прямого подключения к SQLite, используем существующий DatabaseManager
+            conn = sqlite3.connect(self.db.db_path, check_same_thread=False)
+            cursor = conn.cursor()
+        
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS login_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username VARCHAR(50) NOT NULL,
+                    attempt_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    success BOOLEAN DEFAULT 0,
+                    user_agent TEXT
+                )
+            ''')
+        
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_login_username_time 
+                ON login_attempts(username, attempt_time)
+            ''')
+        
+            conn.commit()
+            conn.close()
+            print("✓ Таблица login_attempts создана")
+        except Exception as e:
+            print(f"Ошибка создания таблицы login_attempts: {e}")
+
+    def get_all_users(self):
+        """Получить всех пользователей из БД"""
+        try:
+            query = "SELECT * FROM users ORDER BY username"
+            result = self.db.execute_query(query)
+            return [dict(row) for row in result]
+        except Exception as e:
+            print(f"Ошибка получения пользователей: {e}")
+            return []
 
     def hash_password(self, password):
         """Хеширование пароля"""
         return hashlib.sha256(password.encode()).hexdigest()
 
     def authenticate(self, username, password):
-        """Аутентификация пользователя"""
-        if username in self.users:
-            if self.users[username]['password'] == self.hash_password(password):
-                self.current_user = username
-                return True
-        return False
+        """Аутентификация пользователя с защитой от brute-force"""
+        print(f"Попытка входа для пользователя: {username}")
+
+        # 1. Проверяем, существует ли пользователь
+        existing_user = self.db.get_user_by_username(username)
+        if not existing_user:
+            print(f"Ошибка: Пользователь '{username}' не существует")
+            return False     
+    
+        # 5. Пробуем аутентифицировать
+        user = self.db.authenticate_user(username, password)
+    
+        if user:
+            # УСПЕШНЫЙ ВХОД
+            self.current_user = user
+            # Убедимся, что у пользователя есть home_dir
+            if 'home_dir' not in self.current_user or not self.current_user['home_dir']:
+                self.current_user['home_dir'] = f"/home/{username}"
+            self.log_login_attempt(username, True, "Login successful")
+            print(f"Аутентификация успешна для {username}")
+            return True
+        else:
+            # НЕУДАЧНЫЙ ВХОД
+            # Получаем обновленное количество попыток
+            failed_attempts = self.get_failed_attempts_count(username)
+            remaining = max(0, self.max_attempts - failed_attempts)
+
+            # Проверяем количество неудачных попыток
+            failed_attempts = self.get_failed_attempts_count(username) 
+            print(f"Неудачных попыток за 15 минут: {failed_attempts}")
+
+            # Если превышен лимит - блокируем
+            if failed_attempts >= self.max_attempts:
+                print(f" Учетная запись '{username}' заблокирована!")
+                print(f" Превышено {self.max_attempts} неудачных попыток.")
+                self.log_login_attempt(username, False, "Аккаунт заблокирован.")
+                return False 
+
+            self.log_login_attempt(username, False, "Invalid credentials")
+            
+            print(f"Неверный пароль для пользователя {username}")
+            print(f"Осталось попыток: {remaining}")
+        
+            if remaining <= 0:
+                print(f"Учетная запись заблокирована!")
+        
+            # Добавляем задержку если есть неудачные попытки
+            if failed_attempts > 0:
+                delay = self.delay_time * failed_attempts
+                print(f"Задержка {delay} секунд...")
+                time.sleep(delay)
+
+            return False
 
     def register_user(self):
+        """Регистрация нового пользователя в БД"""
         print("\n=== РЕГИСТРАЦИЯ ===")
         username = input("Введите имя пользователя: ").strip()
         
-        if username in self.users:
+        # Проверяем существует ли пользователь в БД
+        existing = self.db.get_user_by_username(username)  # ← ИЗМЕНИТЬ
+        if existing:
             print("Ошибка: Пользователь уже существует")
             return False
         
@@ -80,21 +171,109 @@ class UserManager:
             print("Ошибка: Пароли не совпадают")
             return False
         
-        self.users[username] = {
-            'password': self.hash_password(password),
-            'group': 'users',
-            'home_dir': f'/home/{username}',
-            'full_name': full_name
-        }
-        self.save_users()
-        print(f"Пользователь {username} успешно зарегистрирован")
-        return True
+        try:
+            user = self.db.create_user(username, password, full_name) 
+            if user:
+                self.current_user = user
+                print(f"Пользователь {username} успешно зарегистрирован")
+                return True
+        except Exception as e:
+            print(f"Ошибка при создании пользователя: {e}")
+        return False
+
+    def get_username(self):
+        """Получить имя текущего пользователя как строку"""
+        if not self.current_user:
+            return None
+        
+        if isinstance(self.current_user, dict):
+            return self.current_user.get('username')
+        else:
+            return str(self.current_user)
+    
+    def get_user_group(self):
+        """Получить группу текущего пользователя"""
+        if not self.current_user:
+            return 'users'
+        
+        user_info = self.get_current_user_info()
+        if user_info:
+            return user_info.get('user_group', 'users')
+        
+        return 'users'
+    
+    def get_user_id(self):
+        """Получить ID текущего пользователя"""
+        if not self.current_user:
+            return None
+        
+        if isinstance(self.current_user, dict):
+            return self.current_user.get('id')
+        
+        # Если current_user не словарь, пытаемся получить ID из БД
+        try:
+            username = self.get_username()
+            if username:
+                query = "SELECT id FROM users WHERE username = ?"
+                result = self.db.execute_query(query, (username,))
+                if result:
+                    return result[0]['id']
+        except Exception as e:
+            print(f"Ошибка получения ID пользователя: {e}")
+        
+        return None
 
     def get_current_user_info(self):
-        """Получить информацию о текущем пользователе"""
+        """Получить информацию о текущем пользователе из БД"""
         if self.current_user:
-            return self.users[self.current_user]
+            return self.current_user
         return None
+
+    def cleanup_old_logs(self, days=30):
+        """Очистка старых логов попыток входа"""
+        try:
+            if self.current_user and self.current_user.get('user_group') in ['admin', 'root']:
+                query = """
+                    DELETE FROM login_attempts 
+                    WHERE datetime(attempt_time) < datetime('now', ?)
+                """
+                # В SQLite execute_query не возвращает количество удаленных строк
+                # Просто выполняем запрос
+                self.db.execute_query(query, (f'-{days} days',))
+                print(f"✓ Очищены логи попыток входа старше {days} дней")
+            else:
+                print("Ошибка: Требуются права администратора")
+        except Exception as e:
+            print(f"Ошибка очистки логов: {e}")
+
+    def get_failed_attempts_count(self, username, minutes=1):
+        """Получить количество неудачных попыток за последние N минут"""
+        try:
+            query = """
+                SELECT COUNT(*) as attempts 
+                FROM login_attempts 
+                WHERE username = ? 
+                AND success = 0 
+                AND datetime(attempt_time) > datetime('now', ?)
+            """
+            # Используем правильный формат параметра времени
+            result = self.db.execute_query(query, (username, f'-{minutes} minutes'))
+            return result[0]['attempts'] if result else 0
+        except Exception as e:
+            print(f"Ошибка получения попыток входа: {e}")
+            return 0
+
+    def log_login_attempt(self, username, success, details=None):
+        """Логирование попытки входа"""
+        try:
+            query = """
+                INSERT INTO login_attempts (username, success, user_agent) 
+                VALUES (?, ?, ?)
+            """
+            agent = details or f"Login {'success' if success else 'failed'}"
+            self.db.execute_query(query, (username, 1 if success else 0, agent))
+        except Exception as e:
+            print(f"Ошибка логирования попытки входа: {e}")
 
     def logout(self):
         """Выход из системы"""
@@ -103,6 +282,7 @@ class UserManager:
 class LinuxLikeFileSystem:
     def __init__(self, user_manager):
         self.user_manager = user_manager
+        self.db_operations = SecureDBOperations()  # ← ДОБАВИТЬ
         self.navigation_history = []
         self.init_file_system()
 
@@ -199,59 +379,78 @@ class LinuxLikeFileSystem:
         
         # Создаем домашние директории для существующих пользователей
         home_dir = self.fs['/']['children']['home']['children']
-        for username in self.user_manager.users:
-            home_dir[username] = {
-                'type': 'directory',
-                'permissions': 'drwxr-xr-x',
-                'owner': username,
-                'group': 'users',
-                'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                'children': {
-                    'Documents': {
-                        'type': 'directory', 
-                        'permissions': 'drwxr-xr-x', 
-                        'owner': username, 
-                        'group': 'users', 
-                        'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
-                        'children': {
-                            'project1': {
-                                'type': 'directory',
-                                'permissions': 'drwxr-xr-x',
-                                'owner': username,
-                                'group': 'users',
-                                'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                                'children': {}
+
+        # Получаем список пользователей из базы данных
+        try:
+            # Добавляем метод в UserManager для получения всех пользователей
+            users = self.user_manager.get_all_users()  # ← нужно добавить этот метод
+            for user in users:
+                username = user['username']
+                home_dir[username] = {
+                    'type': 'directory',
+                    'permissions': 'drwxr-xr-x',
+                    'owner': username,
+                    'group': user.get('user_group', 'users'),
+                    'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'children': {
+                        'Documents': {
+                            'type': 'directory', 
+                            'permissions': 'drwxr-xr-x', 
+                            'owner': username, 
+                            'group': user.get('user_group', 'users'), 
+                            'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
+                            'children': {
+                                'project1': {
+                                    'type': 'directory',
+                                    'permissions': 'drwxr-xr-x',
+                                    'owner': username,
+                                    'group': user.get('user_group', 'users'),
+                                    'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                    'children': {}
+                                }
                             }
+                        },
+                        'Downloads': {
+                            'type': 'directory', 
+                            'permissions': 'drwxr-xr-x', 
+                            'owner': username, 
+                            'group': user.get('user_group', 'users'), 
+                            'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
+                            'children': {}
+                        },
+                        'Pictures': {
+                            'type': 'directory', 
+                            'permissions': 'drwxr-xr-x', 
+                            'owner': username, 
+                            'group': user.get('user_group', 'users'), 
+                            'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
+                            'children': {}
+                        },
+                        'readme.txt': {
+                            'type': 'file', 
+                            'permissions': '-rw-r--r--', 
+                            'owner': username, 
+                            'group': user.get('user_group', 'users'), 
+                            'size': 1024, 
+                            'content': f'Добро пожаловать, {username}!\nЭто ваша домашняя директория.\n\nСодержимое:\n- Documents: для документов\n- Downloads: для загрузок\n- Pictures: для изображений', 
+                            'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         }
-                    },
-                    'Downloads': {
-                        'type': 'directory', 
-                        'permissions': 'drwxr-xr-x', 
-                        'owner': username, 
-                        'group': 'users', 
-                        'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
-                        'children': {}
-                    },
-                    'Pictures': {
-                        'type': 'directory', 
-                        'permissions': 'drwxr-xr-x', 
-                        'owner': username, 
-                        'group': 'users', 
-                        'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 
-                        'children': {}
-                    },
-                    'readme.txt': {
-                        'type': 'file', 
-                        'permissions': '-rw-r--r--', 
-                        'owner': username, 
-                        'group': 'users', 
-                        'size': 1024, 
-                        'content': f'Добро пожаловать, {username}!\nЭто ваша домашняя директория.\n\nСодержимое:\n- Documents: для документов\n- Downloads: для загрузок\n- Pictures: для изображений', 
-                        'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     }
                 }
-            }
-        
+        except Exception as e:
+            print(f"Ошибка при создании домашних директорий: {e}")
+            # Создаем хотя бы домашнюю директорию для текущего пользователя
+            if self.user_manager.current_user:
+                username = self.user_manager.current_user['username']
+                home_dir[username] = {
+                    'type': 'directory',
+                    'permissions': 'drwxr-xr-x',
+                    'owner': username,
+                    'group': 'users',
+                    'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'children': {}
+                }
+                        
         # Диски (разделы) - УМЕНЬШЕННЫЕ РАЗМЕРЫ
         self.disks = {
             'sda1': {
@@ -291,24 +490,72 @@ class LinuxLikeFileSystem:
         return node
 
     def check_permission(self, node, permission='r'):
+        """Проверка прав доступа к файлу/директории"""
         if not self.user_manager.current_user:
+            print("Ошибка: Пользователь не авторизован")
             return False
         
-        if self.user_manager.current_user == 'root':
+        # Получаем имя текущего пользователя
+        current_username = self.user_manager.get_username()
+        if not current_username:
+            print("Ошибка: Не удалось получить имя пользователя")
+            return False
+        
+        # Получаем owner узла как строку
+        node_owner = str(node.get('owner', ''))
+        
+        # Пользователь root имеет все права
+        if current_username == 'root':
             return True
-
-        if self.user_manager.current_user == 'admin':
+        
+        # Пользователь admin также имеет все права (если нужно)
+        if current_username == 'admin':
+            return True
+        
+        # Владелец файла имеет права
+        if node_owner == current_username:
             return True
             
-        if node['owner'] == self.user_manager.current_user:
-            return True
-            
+        # Получаем группу пользователя
+        user_group = self.user_manager.get_user_group()
+        node_group = str(node.get('group', ''))
+        
         # Проверка прав для группы
-        user_info = self.user_manager.get_current_user_info()
-        if user_info and user_info['group'] == node['group']:
-            return True
+        if user_group == node_group:
+            # Проверяем конкретные права доступа
+            return self.check_permission_bits(node.get('permissions', ''), 'group', permission)
             
-        return False
+        # Для остальных пользователей
+        return self.check_permission_bits(node.get('permissions', ''), 'other', permission)
+
+    def log_to_db(self, operation_type, file_path=None, details=None):
+        """Логирование операции в базу данных"""
+        if not self.user_manager.current_user:
+            return
+    
+        file_id = None
+        # Получаем ID файла если он существует в БД
+        if file_path:
+            try:
+                # Пытаемся найти файл в БД по пути
+                query = "SELECT id FROM files WHERE file_path = ?"
+                result = self.db_operations.db.execute_query(query, (file_path,))
+                if result:
+                    file_id = result[0]['id']
+            except Exception as e:
+                # Если не нашли файл в БД, оставляем file_id = None
+                pass
+    
+        try:
+            self.db_operations.safe_log_operation(
+                operation_type=operation_type,
+                user_id=self.user_manager.current_user['id'],
+                file_id=file_id,
+                file_path=file_path,
+                details=details
+            )
+        except Exception as e:
+            print(f"Предупреждение: Не удалось записать лог в БД: {e}")
 
     def ls(self, path=None):
         if path is None:
@@ -339,8 +586,10 @@ class LinuxLikeFileSystem:
             print(f"{item['permissions']:12} {item['owner']:8} {item['group']:8} {size:8} {item['created']:19} {name}")
 
     def cd(self, path):
+        """Сменить директорию с интеграцией логирования в БД"""
         new_path = self.current_path
-        
+    
+        # Обработка специальных команд
         if path == '..':
             # Переход на уровень выше
             if self.current_path == '/':
@@ -351,9 +600,9 @@ class LinuxLikeFileSystem:
             new_path = '/' + '/'.join(parts) if parts else '/'
         elif path == '~' or path == '':
             # Переход в домашнюю директорию
-            user_info = self.user_manager.get_current_user_info()
-            if user_info:
-                new_path = user_info['home_dir']
+            if self.user_manager.current_user:
+                user_info = self.user_manager.get_current_user_info()
+                new_path = user_info.get('home_dir', f"/home/{user_info['username']}")
             else:
                 print("Ошибка: Пользователь не авторизован")
                 return
@@ -365,23 +614,43 @@ class LinuxLikeFileSystem:
             new_path = path
         else:
             # Относительный путь
-            new_path = self.current_path + ('/' if self.current_path != '/' else '') + path
-        
-        target_node = self.get_node(new_path)
-        if target_node and target_node['type'] == 'directory':
-            if self.check_permission(target_node, 'r'):
-                # Сохраняем в историю
-                if self.current_path != new_path:
-                    self.navigation_history.append(self.current_path)
-                    if len(self.navigation_history) > 10:  # Ограничиваем историю
-                        self.navigation_history.pop(0)
-                
-                self.current_path = new_path
-                print(f"Переход в: {new_path}")
+            if self.current_path.endswith('/'):
+                new_path = self.current_path + path
             else:
-                print(f"Ошибка: Нет прав доступа к {new_path}")
-        else:
-            print(f"Ошибка: Директория {new_path} не существует")
+                new_path = self.current_path + '/' + path
+    
+        # Валидация пути
+        target_node = self.get_node(new_path)
+        if not target_node:
+            print(f"Ошибка: Директория '{new_path}' не существует")
+            return
+    
+        if target_node['type'] != 'directory':
+            print(f"Ошибка: '{new_path}' не является директорией")
+            return
+    
+        # Проверка прав доступа
+        if not self.check_permission(target_node, 'r'):
+            print(f"Ошибка: Нет прав доступа к директории '{new_path}'")
+            return
+    
+        # Сохраняем в историю навигации
+        if self.current_path != new_path:
+            self.navigation_history.append(self.current_path)
+            if len(self.navigation_history) > 10:
+                self.navigation_history.pop(0)
+    
+        # Логируем операцию в БД
+        if self.user_manager.current_user:
+            self.log_to_db(
+                operation_type="NAVIGATION",
+                file_path=new_path,
+                details=f"Смена директории: {self.current_path} -> {new_path}"
+            )
+    
+        # Обновляем текущий путь
+        self.current_path = new_path
+        print(f"Переход в: {new_path}")
 
     def pwd(self):
         print(f"Текущая директория: {self.current_path}")
@@ -396,45 +665,119 @@ class LinuxLikeFileSystem:
             print(f"Ошибка: Директория {name} уже существует")
             return
         
+        # Получаем имя пользователя и группу
+        owner_name = self.user_manager.get_username() or 'unknown'
+        group_name = self.user_manager.get_user_group()
+        
         current_node.setdefault('children', {})[name] = {
             'type': 'directory',
             'permissions': 'drwxr-xr-x',
-            'owner': self.user_manager.current_user,
-            'group': 'users',
+            'owner': owner_name,
+            'group': group_name,
             'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'children': {}
         }
+        
+        # Логирование
+        if self.user_manager.current_user:
+            dir_path = f"{self.current_path}/{name}" if self.current_path != '/' else f"/{name}"
+            self.log_to_db(
+                operation_type="DIR_CREATE",
+                file_path=dir_path,
+                details=f"Создана директория '{name}'"
+            )
+        
         print(f"Директория '{name}' создана в {self.current_path}")
 
+
     def touch(self, name):
+        """Создать файл с записью в БД"""
+        # Проверка прав на запись в текущую директорию
         current_node = self.get_node(self.current_path)
+        if not current_node:
+            print(f"Ошибка: Текущая директория '{self.current_path}' не существует")
+            return
+    
         if not self.check_permission(current_node, 'w'):
             print(f"Ошибка: Нет прав на запись в текущую директорию")
             return
-        
+    
+        # Проверка существования файла
         if name in current_node.get('children', {}):
-            print(f"Файл '{name}' уже существует")
+            print(f"Ошибка: Файл '{name}' уже существует")
             return
     
-        # Предлагаем ввести начальное содержимое
+        # Ввод начального содержимого
+        print(f"\nСоздание файла '{name}' в {self.current_path}")
         initial_content = input("Введите начальное содержимое файла (или Enter для пустого): ").strip()
     
+        # Расчет размера
+        file_size = len(initial_content.encode('utf-8'))
+    
+        # Проверка доступного места на диске
+        if not self.check_disk_space(file_size):
+            print("Ошибка: Недостаточно места на диске для создания файла")
+            return
+    
+        # Проверка максимального размера файла
+        if file_size > 100 * 1024 * 1024:  # 100MB
+            print("Ошибка: Размер файла превышает максимально допустимый (100MB)")
+            return
+    
+        # Получаем имя пользователя и группу
+        owner_name = self.user_manager.get_username() or 'unknown'
+        group_name = self.user_manager.get_user_group()
+    
+        # Создание файла в виртуальной файловой системе
         current_node.setdefault('children', {})[name] = {
             'type': 'file',
             'permissions': '-rw-r--r--',
-            'owner': self.user_manager.current_user,
-            'group': 'users',
-            'size': len(initial_content.encode('utf-8')),
+            'owner': owner_name, 
+            'group': group_name, 
+            'size': file_size,
             'content': initial_content,
             'created': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'modified': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
     
-        # Обновляем использование дисков
+        # Обновление использования дисков
         self.update_disk_usage()
     
-        print(f"Файл '{name}' создан в {self.current_path}")
-        print(f"Размер: {len(initial_content.encode('utf-8'))} bytes")
+        # Логирование и сохранение в БД
+        if self.user_manager.current_user:
+            file_path = f"{self.current_path}/{name}" if self.current_path != '/' else f"/{name}"
+            
+            # Получаем ID пользователя
+            user_id = self.user_manager.get_user_id()
+            
+            if user_id:
+                # Логируем операцию
+                self.log_to_db(
+                    operation_type="FILE_CREATE",
+                    file_path=file_path,
+                    details=f"Создан файл '{name}', размер: {file_size} байт"
+                )
+            
+                # Сохраняем информацию о файле в БД
+                try:
+                    self.db_operations.safe_file_creation(
+                        filename=name,
+                        file_path=file_path,
+                        file_size=file_size,
+                        file_type='file',
+                        owner_id=user_id,
+                        permissions='rw-r--r--'
+                    )
+                except Exception as e:
+                    print(f"Предупреждение: Не удалось сохранить информацию о файле в БД: {e}")
+            else:
+                print("Предупреждение: Не удалось получить ID пользователя для записи в БД")
+    
+        print(f"\n Файл '{name}' успешно создан")
+        print(f"  Путь: {self.current_path}/{name}")
+        print(f"  Размер: {file_size} байт")
+        print(f"  Владелец: {owner_name}")
+        print(f"  Группа: {group_name}")
 
 
     def cat(self, name):
@@ -505,67 +848,117 @@ class LinuxLikeFileSystem:
         print(f"Успешно переименовано из '{old_name}' в '{new_name}'")
 
     def edit_file(self, name):
+        """Редактировать содержимое файла с сохранением в БД"""
+        # Полный путь к файлу
         file_path = self.current_path + ('/' if self.current_path != '/' else '') + name
-        node = self.get_node(file_path)
     
+        # Получение узла файла
+        node = self.get_node(file_path)
         if not node:
             print(f"Ошибка: Файл '{name}' не существует")
-            return
+            return 
     
         if node['type'] != 'file':
             print(f"Ошибка: '{name}' не является файлом")
-            return
+            return  # ДОБАВЛЕН return
     
+        # Проверка прав доступа
         if not self.check_permission(node, 'w'):
             print(f"Ошибка: Нет прав на запись в файл '{name}'")
             return
     
-        print(f"\nРедактирование файла '{name}':")
-        print("Текущее содержимое:")
-        print("-" * 40)
+        print(f"\n{'='*60}")
+        print(f"РЕДАКТИРОВАНИЕ ФАЙЛА: {name}")
+        print(f"{'='*60}")
+        print(f"Путь: {file_path}")
+        print(f"Текущий размер: {node.get('size', 0)} байт")
+        print(f"Владелец: {node['owner']}")
+        print(f"Последнее изменение: {node.get('modified', node.get('created', 'N/A'))}")
+        print(f"{'-'*60}")
+    
+        # Показываем текущее содержимое
         current_content = node.get('content', '')
-        print(current_content)
+        if current_content:
+            print("Текущее содержимое:")
+            print("-" * 40)
+            print(current_content)
+            print("-" * 40)
+        else:
+            print("Файл пуст")
+    
+        # Ввод нового содержимого
+        print("Введите все строки, затем нажмите Enter на пустой строке для завершения:")
         print("-" * 40)
     
-        print("\nВведите новое содержимое (Ctrl+D или пустая строка для завершения):")
+        lines = []
+        print("Начинайте ввод (пустая строка для завершения):")
     
-        try:
-            lines = []
-            while True:
-                try:
-                    line = input()
-                    lines.append(line)
-                except EOFError:
+        while True:
+            try:
+                line = input()
+                if line == "":  # Пустая строка завершает ввод
                     break
-                except KeyboardInterrupt:
-                    print("\nОтмена редактирования")
-                    return
-        
-            new_content = '\n'.join(lines)
-        
-            # Проверяем, не превысит ли новый размер лимиты диска
-            new_size = len(new_content.encode('utf-8'))
-            old_size = node.get('size', 0)
-            size_diff = new_size - old_size
-        
-            # Проверяем доступное место на диске
-            if not self.check_disk_space(size_diff):
-                print("Ошибка: Недостаточно места на диске")
+                lines.append(line)
+            except (EOFError, KeyboardInterrupt):
+                print("\nЗавершение ввода...")
+                break
+    
+        # Если ничего не ввели, спрашиваем
+        if not lines:
+            keep_old = input("Файл будет пустым. Продолжить? (Y/n): ").strip().lower()
+            if keep_old not in ['', 'y', 'yes']:
+                print("Редактирование отменено.")
                 return
+    
+        new_content = '\n'.join(lines)
+        new_size = len(new_content.encode('utf-8'))
+        old_size = node.get('size', 0)
+        size_diff = new_size - old_size
         
-            # Обновляем файл
-            node['content'] = new_content
-            node['size'] = new_size
-            node['modified'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        # Проверка доступного места на диске
+        if size_diff > 0 and not self.check_disk_space(size_diff):
+            print(f"Ошибка: Недостаточно места на диске. Требуется дополнительно: {size_diff} байт")
+            return
         
-            # Обновляем использование дисков
-            self.update_disk_usage()
+        # Проверка максимального размера файла
+        if new_size > 100 * 1024 * 1024:  # 100MB
+            print("Ошибка: Новый размер файла превышает максимально допустимый (100MB)")
+            return
         
-            print(f"Файл '{name}' успешно обновлен")
-            print(f"Новый размер: {new_size} bytes")
+        # Обновляем файл в виртуальной файловой системе
+        node['content'] = new_content
+        node['size'] = new_size
+        node['modified'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
+        # Обновляем использование дисков
+        self.update_disk_usage()
+        
+        # Логирование и обновление в БД
+        if self.user_manager.current_user:
+            # Логируем операцию
+            self.log_to_db(
+                operation_type="FILE_EDIT",
+                file_path=file_path,
+                details=f"Файл отредактирован. Старый размер: {old_size} байт, новый: {new_size} байт"
+            )
+            
+        # Обновляем информацию о файле в БД
+        try:
+            self.db_operations.safe_file_update(file_path, new_size)
         except Exception as e:
-            print(f"Ошибка при редактировании файла: {e}")
+            print(f"Предупреждение: Не удалось обновить информацию о файле в БД: {e}")
+        
+            print(f"\n{'='*60}")
+            print(f"✓ Файл '{name}' успешно обновлен")
+            print(f"  Новый размер: {new_size} байт")
+            if size_diff != 0:
+                change = f"+{size_diff}" if size_diff > 0 else f"{size_diff}"
+                print(f"  Изменение размера: {change} байт")
+            print(f"  Линий в файле: {len(lines)}")
+            print(f"{'='*60}")
+        except Exception as e:
+            print(f"\nОшибка при редактировании файла: {e}")
+            print("Изменения не сохранены.")
 
 
     def check_disk_space(self, required_bytes):
@@ -582,42 +975,57 @@ class LinuxLikeFileSystem:
         """Обновить использование дисков на основе реальных данных"""
         def calculate_fs_size(node):
             size = 0
-            if node['type'] == 'file':
+            node_type = node.get('type')
+            if node_type == 'file':
                 size += node.get('size', 0)
-            elif node['type'] == 'directory':
-                for child in node.get('children', {}).values():
+            elif node_type == 'directory':
+                children = node.get('children', {})
+                for child in children.values():
                     size += calculate_fs_size(child)
             return size
         
-        total_used = calculate_fs_size(self.fs['/'])
+        try:
+            total_used = calculate_fs_size(self.fs['/'])
+        except Exception as e:
+            print(f"Ошибка при расчете размера файловой системы: {e}")
+            total_used = 0
         
         # Обновляем информацию о дисках
         for disk_name, disk_info in self.disks.items():
-            if disk_info['mount_point'] == '/':
-                # Для корневого диска используем общий размер
-                used_bytes = total_used
-                used_gb = used_bytes // (1024**3)
-                size_gb = int(disk_info['size'].replace('GB', ''))
-                free_gb = max(0, size_gb - used_gb)
+            try:
+                if disk_info['mount_point'] == '/':
+                    # Для корневого диска используем общий размер
+                    used_bytes = total_used
+                    used_gb = used_bytes // (1024**3)
+                    size_gb_str = disk_info.get('size', '0GB').replace('GB', '')
+                    size_gb = int(size_gb_str) if size_gb_str.isdigit() else 0
+                    free_gb = max(0, size_gb - used_gb)
+                    
+                    disk_info['used'] = f"{used_gb}GB"
+                    disk_info['free'] = f"{free_gb}GB"
+                    disk_info['used_bytes'] = used_bytes
+                    disk_info['usage_percent'] = (used_gb / size_gb * 100) if size_gb > 0 else 0
                 
-                disk_info['used'] = f"{used_gb}GB"
-                disk_info['free'] = f"{free_gb}GB"
-                disk_info['used_bytes'] = used_bytes
-                disk_info['usage_percent'] = (used_gb / size_gb * 100) if size_gb > 0 else 0
-            
-            elif disk_info['mount_point'] == '/home':
-                # Для домашнего диска вычисляем размер домашних директорий
-                home_node = self.get_node('/home')
-                home_size = calculate_fs_size(home_node) if home_node else 0
-                used_bytes = home_size
-                used_gb = used_bytes // (1024**3)
-                size_gb = int(disk_info['size'].replace('GB', ''))
-                free_gb = max(0, size_gb - used_gb)
-                
-                disk_info['used'] = f"{used_gb}GB"
-                disk_info['free'] = f"{free_gb}GB"
-                disk_info['used_bytes'] = home_size
-                disk_info['usage_percent'] = (used_gb / size_gb * 100) if size_gb > 0 else 0
+                elif disk_info['mount_point'] == '/home':
+                    # Для домашнего диска вычисляем размер домашних директорий
+                    home_node = self.get_node('/home')
+                    if home_node:
+                        home_size = calculate_fs_size(home_node)
+                    else:
+                        home_size = 0
+                    
+                    used_bytes = home_size
+                    used_gb = used_bytes // (1024**3)
+                    size_gb_str = disk_info.get('size', '0GB').replace('GB', '')
+                    size_gb = int(size_gb_str) if size_gb_str.isdigit() else 0
+                    free_gb = max(0, size_gb - used_gb)
+                    
+                    disk_info['used'] = f"{used_gb}GB"
+                    disk_info['free'] = f"{free_gb}GB"
+                    disk_info['used_bytes'] = home_size
+                    disk_info['usage_percent'] = (used_gb / size_gb * 100) if size_gb > 0 else 0
+            except Exception as e:
+                print(f"Ошибка обновления информации о диске {disk_name}: {e}")
 
     def get_disk_space_info(self):
         """Получить информацию о свободном месте на дисках"""
@@ -645,17 +1053,17 @@ class LinuxLikeFileSystem:
         while True:
             current_relative_path = self.current_path if self.current_path != '/' else '/'
             print()
-            print(' '*50, f"НАВИГАЦИЯ ПО ФАЙЛОВОЙ СИСТЕМЕ")
-            print(' '*50, f"Пользователь: {self.user_manager.current_user}")
-            print(' '*50, "1. Показать содержимое текущей директории (ls)")
-            print(' '*50, "2. Перейти в поддиректорию (cd <name>)")
-            print(' '*50, "3. Перейти на уровень вверх (cd ..)")
-            print(' '*50, "4. Перейти в домашнюю директорию (cd ~)")
-            print(' '*50, "5. Перейти в корневую директорию (cd /)")
-            print(' '*50, "6. Показать текущий путь (pwd)")
-            print(' '*50, "7. История навигации")
-            print(' '*50, "8. Операции с файлами и директориями")
-            print(' '*50, "0. Назад в главное меню")
+            print(' '*30, f"НАВИГАЦИЯ ПО ФАЙЛОВОЙ СИСТЕМЕ")
+            print(' '*30, f"Пользователь: {self.user_manager.current_user['username']}")
+            print(' '*30, "1. Показать содержимое текущей директории (ls)")
+            print(' '*30, "2. Перейти в поддиректорию (cd <name>)")
+            print(' '*30, "3. Перейти на уровень вверх (cd ..)")
+            print(' '*30, "4. Перейти в домашнюю директорию (cd ~)")
+            print(' '*30, "5. Перейти в корневую директорию (cd /)")
+            print(' '*30, "6. Показать текущий путь (pwd)")
+            print(' '*30, "7. История навигации")
+            print(' '*30, "8. Операции с файлами и директориями")
+            print(' '*30, "0. Назад в главное меню")
             print()
             print(f"Текущий путь: {current_relative_path}")
         
@@ -739,17 +1147,17 @@ class LinuxLikeFileSystem:
 
     def file_operations_menu(self):
         while True:
-            print(' '*50, f"\n=== ОПЕРАЦИИ С ФАЙЛАМИ И ДИРЕКТОРИЯМИ ===")
-            print(' '*50, f"Текущий путь: {self.current_path}")
-            print(' '*50, "1. Создать файл (touch)")
-            print(' '*50, "2. Показать содержимое файла (cat)")
-            print(' '*50, "3. Удалить файл (rm)")
-            print(' '*50, "4. Создать директорию (mkdir)")
-            print(' '*50, "5. Удалить директорию (rmdir)")
-            print(' '*50, "6. Редактировать файл (edit)")
-            print(' '*50, "7. Переименовать файл/директорию")
-            print(' '*50, "8. Информация о файле/директории")
-            print(' '*50, "0. Назад к навигации")
+            print(' '*30, f"=== ОПЕРАЦИИ С ФАЙЛАМИ И ДИРЕКТОРИЯМИ ===")
+            print(' '*30, f"Текущий путь: {self.current_path}")
+            print(' '*30, "1. Создать файл (touch)")
+            print(' '*30, "2. Показать содержимое файла (cat)")
+            print(' '*30, "3. Удалить файл (rm)")
+            print(' '*30, "4. Создать директорию (mkdir)")
+            print(' '*30, "5. Удалить директорию (rmdir)")
+            print(' '*30, "6. Редактировать файл (edit)")
+            print(' '*30, "7. Переименовать файл/директорию")
+            print(' '*30, "8. Информация о файле/директории")
+            print(' '*30, "0. Назад к навигации")
             
             choice = input("Выберите действие: ").strip()
             
@@ -816,19 +1224,25 @@ class LinuxLikeFileSystem:
             return
         
         print(f"\nИнформация о '{name}':")
-        print(f"  Тип: {'Директория' if node['type'] == 'directory' else 'Файл'}")
-        print(f"  Права доступа: {node['permissions']}")
-        print(f"  Владелец: {node['owner']}")
-        print(f"  Группа: {node['group']}")
-        print(f"  Создан: {node['created']}")
+        print(f"  Тип: {'Директория' if node.get('type') == 'directory' else 'Файл'}")
+        print(f"  Права доступа: {node.get('permissions', '??????????')}")
+        print(f"  Владелец: {node.get('owner', 'unknown')}")
+        print(f"  Группа: {node.get('group', 'unknown')}")
+        print(f"  Создан: {node.get('created', 'N/A')}")
         
-        if node['type'] == 'file':
-            print(f"  Размер: {node.get('size', 0)} bytes")
+        if node.get('type') == 'file':
+            print(f"  Размер: {node.get('size', 0)} байт")
             content = node.get('content', '')
             print(f"  Строк: {len(content.splitlines())}")
+            if node.get('modified'):
+                print(f"  Изменен: {node.get('modified')}")
         else:
-            children_count = len(node.get('children', {}))
+            children = node.get('children', {})
+            children_count = len(children)
             print(f"  Элементов: {children_count}")
+            if children_count > 0:
+                print(f"  Поддиректории: {sum(1 for item in children.values() if item.get('type') == 'directory')}")
+                print(f"  Файлы: {sum(1 for item in children.values() if item.get('type') == 'file')}")
 
 
 
@@ -851,13 +1265,14 @@ def show_disk_info(file_system):
             print(f"{disk_name:<10} {mount_point:<15} {size_gb:<12} {used_gb:<12} {free_gb:<12} {usage_percent:.1f}%")
 
 def login_screen(user_manager):
-    """Экран авторизации"""
+    """Экран авторизации с защитой от brute-force"""
     while True:
         print("\n" + "="*50)
         print("          СИСТЕМА УПРАВЛЕНИЯ ФАЙЛАМИ")
         print("="*50)
         print("1. Вход в систему")
         print("2. Регистрация")
+        print("3. Сбросить блокировку (только для администраторов)")  # ← НОВЫЙ ПУНКТ
         print("0. Выход")
         
         choice = input("Выберите действие: ").strip()
@@ -867,6 +1282,9 @@ def login_screen(user_manager):
             username = input("Имя пользователя: ").strip()
             password = getpass.getpass("Пароль: ").strip()
             
+            # Получаем IP-адрес (для реального приложения)
+            ip_address = '127.0.0.1'  # В демо-версии используем localhost
+            
             if user_manager.authenticate(username, password):
                 print(f"\nДобро пожаловать, {username}!")
                 return True
@@ -875,6 +1293,17 @@ def login_screen(user_manager):
                 
         elif choice == '2':
             user_manager.register_user()
+            
+        elif choice == '3':
+            # Сброс блокировки (только для админов)
+            admin_username = input("Введите имя администратора: ").strip()
+            admin_password = getpass.getpass("Пароль администратора: ").strip()
+            
+            if user_manager.db.authenticate_user(admin_username, admin_password):
+                username_to_unlock = input("Введите имя пользователя для разблокировки: ").strip()
+                user_manager.unlock_account(username_to_unlock)
+            else:
+                print("Ошибка: Неверные учетные данные администратора")
             
         elif choice == '0':
             print("Выход из программы...")
@@ -945,7 +1374,7 @@ def user_operations_menu(user_manager):
             if user_info:
                 print(f"Текущий пользователь: {user_manager.current_user}")
                 print(f"Полное имя: {user_info['full_name']}")
-                print(f"Группа: {user_info['group']}")
+                print(f"Группа: {user_info['user_group']}")
                 print(f"Домашняя директория: {user_info['home_dir']}")
         elif choice == '2':
             print(f"Система: {platform.system()}")
@@ -1055,6 +1484,62 @@ def view_zip_contents():
     except FileNotFoundError:
         print(f"ZIP архив {zip_name} не найден")
 
+
+def view_db_logs_menu(file_system):
+    """Меню просмотра логов из базы данных"""
+    while True:
+        print("\n=== ЛОГИ ОПЕРАЦИЙ ИЗ БАЗЫ ДАННЫХ ===")
+        print("1. Показать все логи")
+        print("2. Показать мои логи")
+        print("3. Статистика использования")
+        print("4. Отчет о безопасности")
+        print("0. Назад")
+        
+        choice = input("Выберите действие: ").strip()
+        
+        if choice == '1':
+            logs = file_system.db_operations.safe_get_audit_logs(limit=50)
+            print("\nПоследние 50 операций:")
+            print("-" * 100)
+            for log in logs:
+                print(f"{log['timestamp']} | {log.get('username', 'N/A')} | {log['operation_type']} | {log.get('file_path', '')} | {log.get('details', '')}")
+        
+        elif choice == '2':
+            if file_system.user_manager.current_user:
+                logs = file_system.db_operations.safe_get_audit_logs(
+                    user_id=file_system.user_manager.current_user['id'], 
+                    limit=30
+                )
+                print(f"\nМои последние 30 операций:")
+                print("-" * 100)
+                for log in logs:
+                    print(f"{log['timestamp']} | {log['operation_type']} | {log.get('file_path', '')} | {log.get('details', '')}")
+        
+        elif choice == '3':
+            stats = file_system.db_operations.get_security_report()['disk_usage']
+            print("\nСтатистика использования:")
+            print("-" * 60)
+            for stat in stats:
+                size_mb = stat['total_size'] / (1024*1024) if stat['total_size'] else 0
+                print(f"{stat['username']}: {stat['file_count']} файлов, {size_mb:.2f} MB")
+        
+        elif choice == '4':
+            report = file_system.db_operations.get_security_report()
+            print("\nОтчет о безопасности:")
+            print("-" * 60)
+            if report['suspicious_activities']:
+                print("Обнаружены подозрительные активности:")
+                for activity in report['suspicious_activities']:
+                    print(f"{activity}")
+            else:
+                print("Подозрительных активностей не обнаружено ✓")
+        
+        elif choice == '0':
+            break
+        else:
+            print("Неверный выбор")
+
+
 def main():
     user_manager = UserManager()
     
@@ -1065,12 +1550,13 @@ def main():
         file_system = LinuxLikeFileSystem(user_manager)
         
         while user_manager.current_user:
-            print(f"\n=== ГЛАВНОЕ МЕНЮ (пользователь: {user_manager.current_user}) ===")
+            print(f"\n=== ГЛАВНОЕ МЕНЮ ===")
             print("1. Файловая система")
             print("2. Работа с JSON/XML")
             print("3. Операции с ZIP архивами")
             print("4. Информация о дисках")
             print("5. Операции пользователя")
+            print("6. Логи операций (БД)")
             print("0. Выход")
             
             choice = input("Выберите пункт меню: ").strip()
@@ -1086,6 +1572,8 @@ def main():
             elif choice == '5':
                 if user_operations_menu(user_manager):
                     break
+            elif choice == '6':  
+                view_db_logs_menu(file_system)
             elif choice == '0':
                 user_manager.logout()
                 print("Выход из учетной записи...")

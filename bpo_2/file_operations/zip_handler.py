@@ -17,8 +17,7 @@ class ZipHandler:
     def create_zip(self, source_paths: list, zip_path: str) -> bool:
         """Создание ZIP архива с проверками безопасности"""
         try:
-            safe_zip_path = self.validator.validate_path(zip_path)
-            
+            safe_zip_path = self.validator.validate_path(zip_path)           
             # Проверка расширения файла
             if safe_zip_path.suffix.lower() != '.zip':
                 raise ValueError("Целевой файл должен иметь расширение .zip")
@@ -51,9 +50,7 @@ class ZipHandler:
                     # Сохранение относительных путей
                     arcname = file_path.relative_to(Config.BASE_DIR)
                     zipf.write(file_path, arcname)
-            
-            return True
-        
+            return True        
         except Exception as e:
             raise e
     
